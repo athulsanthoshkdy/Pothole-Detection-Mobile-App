@@ -1,0 +1,25 @@
+<resources>
+    <string name="app_name">PotholeDetect</string>
+    <string name="login_title">Welcome Back</string>
+    <string name="login_subtitle">Smart Road Monitoring</string>
+    <string name="email_hint">Email</string>
+    <string name="password_hint">Password</string>
+    <string name="login_button">Sign In</string>
+    <string name="register_button">Create Account</string>
+    <string name="detection_active">Detection Active - Monitoring for potholes...</string>
+    <string name="detection_stopped">Detection Stopped</string>
+    <string name="pothole_detected">Pothole detected!</string>
+    <string name="permission_required">Location permission required for detection</string>
+    <string name="login_successful">Login successful</string>
+    <string name="login_failed">Authentication failed</string>
+    <string name="registration_successful">Registration successful</string>
+    <string name="registration_failed">Registration failed</string>
+    <string name="logout_successful">Logged out successfully</string>
+    <string name="settings_title">Settings</string>
+    <string name="history_title">Detection History</string>
+    <string name="sensor_data_title">Sensor Data</string>
+    <string name="current_speed_title">Current Speed</string>
+    <string name="potholes_detected_title">Potholes Detected</string>
+    <string name="start_detection">Start Detection</string>
+    <string name="stop_detection">Stop Detection</string>
+</resources>
