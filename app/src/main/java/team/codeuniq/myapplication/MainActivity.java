@@ -13,6 +13,7 @@ import android.hardware.SensorManager;
 import android.location.Location;
 import android.location.LocationListener;
 import android.location.LocationManager;
+import android.os.Build;
 import android.os.Bundle;
 import android.os.Handler;
 import android.util.Log;
@@ -50,6 +51,7 @@ import java.util.ArrayList;
 import java.util.HashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.UUID;
 import java.util.concurrent.ExecutionException;
 
 public class MainActivity extends AppCompatActivity implements SensorEventListener, LocationListener {
@@ -87,17 +89,23 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     private float currentSpeed = 0f;
     private int detectionCount = 0;
 
+    // RoadSurP Paper Implementation Variables
+    private ArrayList<Float> zAxisBuffer = new ArrayList<>();
+    private static final int BUFFER_SIZE = 50; // ~1 second at 50Hz
+    private static final float BASE_THRESHOLD = 8.0f; // T0 - base threshold
+    private static final float SPEED_SCALING_FACTOR = 0.1f; // S - speed scaling
+    private static final float SPEED_OFFSET = 5.0f; // L - speed offset
+    private long lastDetectionTime = 0;
+    private static final long DETECTION_COOLDOWN_MS = 3000; // 3 seconds debounce
+    private String currentSessionId; // Session/trip identifier
+
     // Sensor Data
     private float[] accelerometerValues = new float[3];
     private float[] gyroscopeValues = new float[3];
 
     // Detection Thresholds
-    private static final float POTHOLE_THRESHOLD = 12.0f;
     private static final float SPEED_THRESHOLD = 10.0f; // km/h
     private static final int CONFIDENCE_THRESHOLD = 75;
-
-    private long lastDetectionTime = 0; // milliseconds
-    private static final long DETECTION_COOLDOWN_MS = 5000; // e.g., 5 seconds gap
 
     // Handler for UI updates
     private Handler uiHandler = new Handler();
@@ -114,6 +122,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     protected void onCreate(Bundle savedInstanceState) {
         super.onCreate(savedInstanceState);
         setContentView(R.layout.activity_main);
+
+        // Generate session ID for this trip
+        currentSessionId = UUID.randomUUID().toString();
 
         initializeViews();
         initializeSensors();
@@ -187,8 +198,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             permissionsToRequest.add(Manifest.permission.ACCESS_COARSE_LOCATION);
         }
 
-        // Note: WRITE_EXTERNAL_STORAGE is not needed for app's cache directory
-        // Remove it if you're only saving to cache/internal storage
         if (ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                 != PackageManager.PERMISSION_GRANTED) {
             permissionsToRequest.add(Manifest.permission.WRITE_EXTERNAL_STORAGE);
@@ -231,7 +240,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     }
 
     private boolean hasAllPermissions() {
-        // Check essential permissions only
         boolean cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                 == PackageManager.PERMISSION_GRANTED;
         boolean locationGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -279,13 +287,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 new ImageCapture.OnImageSavedCallback() {
                     @Override
                     public void onImageSaved(@NonNull ImageCapture.OutputFileResults output) {
-                        // Compress image before upload
                         File compressedFile = new File(getCacheDir(), "pothole_compressed_" + System.currentTimeMillis() + ".jpg");
                         compressImageFile(photoFile, compressedFile);
-
-                        // Delete original file if desired
                         photoFile.delete();
-
                         getCurrentLocationAndUpload(compressedFile);
                     }
 
@@ -296,11 +300,16 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                     }
                 });
     }
+
     private void compressImageFile(File originalFile, File compressedFile) {
         try {
             Bitmap bitmap = BitmapFactory.decodeFile(originalFile.getAbsolutePath());
 
-            // Resize bitmap if desired (e.g. max 720x720)
+            if (bitmap == null) {
+                Log.e(TAG, "Failed to decode bitmap from file");
+                return;
+            }
+
             int maxWidth = 720;
             int maxHeight = 720;
             int width = bitmap.getWidth();
@@ -313,18 +322,16 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 bitmap = Bitmap.createScaledBitmap(bitmap, newWidth, newHeight, true);
             }
 
-            // Compress and save with lower quality (e.g. 70%)
             FileOutputStream fos = new FileOutputStream(compressedFile);
             bitmap.compress(Bitmap.CompressFormat.JPEG, 70, fos);
             fos.close();
+            bitmap.recycle();
 
         } catch (IOException e) {
             e.printStackTrace();
             Log.e(TAG, "Image compression failed: " + e.getMessage());
         }
     }
-
-
 
     private void getCurrentLocationAndUpload(File photoFile) {
         if (ActivityCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION) !=
@@ -352,22 +359,14 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         imageRef.putFile(android.net.Uri.fromFile(photoFile))
                 .addOnSuccessListener(taskSnapshot -> {
                     imageRef.getDownloadUrl().addOnSuccessListener(uri -> {
-                        Map<String, Object> potholeData = new HashMap<>();
-                        potholeData.put("timestamp", FieldValue.serverTimestamp());
-                        potholeData.put("imageUrl", uri.toString());
-                        potholeData.put("latitude", location.getLatitude());
-                        potholeData.put("longitude", location.getLongitude());
-                        potholeData.put("user_id", userId);
-                        potholeData.put("confidence", 0);
-                        potholeData.put("speed", 0);
-                        // Store location in accelerometer_data field as requested
-                        Map<String, Object> accelerometerData = new HashMap<>();
-                        accelerometerData.put("x", location.getLatitude());
-                        accelerometerData.put("y", location.getLongitude());
-                        accelerometerData.put("z", location.getAltitude());
-                        potholeData.put("accelerometer_data", accelerometerData);
+                        // Create unified data structure for image-based detection
+                        Map<String, Object> eventData = createUnifiedEventData("IMAGE");
+                        eventData.put("imageUrl", uri.toString());
+                        eventData.put("latitude", location.getLatitude());
+                        eventData.put("longitude", location.getLongitude());
+                        eventData.put("speed", currentSpeed);
 
-                        firestore.collection("potholes").document(docId).set(potholeData)
+                        firestore.collection("potholes").document(docId).set(eventData)
                                 .addOnSuccessListener(aVoid -> {
                                     Toast.makeText(MainActivity.this,
                                             "Photo and data uploaded successfully!", Toast.LENGTH_SHORT).show();
@@ -398,6 +397,204 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         captureButton.setVisibility(View.GONE);
     }
 
+    // MODIFIED: Research paper implementation for sensor detection
+
+    @Override
+    public void onSensorChanged(SensorEvent event) {
+        if (!isDetectionActive) return;
+
+        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
+            accelerometerValues = event.values.clone();
+
+            // Add Z-axis to buffer for feature extraction
+            addToZAxisBuffer(accelerometerValues[2]);
+
+            updateSensorDisplay();
+
+            if (shouldDetectPothole()) {
+                checkForPotholeRoadSurP();
+            }
+        } else if (event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
+            gyroscopeValues = event.values.clone();
+        }
+    }
+
+    private void addToZAxisBuffer(float zValue) {
+        zAxisBuffer.add(zValue);
+        if (zAxisBuffer.size() > BUFFER_SIZE) {
+            zAxisBuffer.remove(0); // Remove oldest value
+        }
+    }
+
+    private float calculateDynamicThreshold() {
+        // T_t = T_0 + S × (V_t - L) - Dynamic threshold formula from paper
+        return BASE_THRESHOLD + SPEED_SCALING_FACTOR * (currentSpeed - SPEED_OFFSET);
+    }
+
+    private void checkForPotholeRoadSurP() {
+        if (zAxisBuffer.size() < 10) return; // Need minimum buffer
+
+        float currentZ = accelerometerValues[2];
+        float dynamicThreshold = calculateDynamicThreshold();
+        long now = System.currentTimeMillis();
+
+        // Check if threshold exceeded and cooldown period passed
+        if (Math.abs(currentZ) > dynamicThreshold &&
+                (now - lastDetectionTime > DETECTION_COOLDOWN_MS)) {
+
+            // Extract features as per paper
+            PotholeFeatures features = extractFeatures(currentZ);
+
+            if (features != null) {
+                lastDetectionTime = now;
+                onPotholeDetectedRoadSurP(features, dynamicThreshold);
+            }
+        }
+    }
+
+    private PotholeFeatures extractFeatures(float zt) {
+        try {
+            int currentIndex = zAxisBuffer.size() - 1;
+
+            // Find local min/max before and after current point
+            float zPrev = findLocalExtrema(currentIndex - 5, currentIndex, true);
+            float zNext = findLocalExtrema(currentIndex, Math.min(currentIndex + 5, zAxisBuffer.size() - 1), false);
+
+            // Calculate interval since last detection
+            long intervalSinceLastDetection = System.currentTimeMillis() - lastDetectionTime;
+
+            return new PotholeFeatures(zt, zPrev, zNext, intervalSinceLastDetection, currentSpeed);
+        } catch (Exception e) {
+            Log.e(TAG, "Error extracting features: " + e.getMessage());
+            return null;
+        }
+    }
+
+    private float findLocalExtrema(int startIdx, int endIdx, boolean isPrevious) {
+        if (startIdx < 0 || endIdx >= zAxisBuffer.size()) return 0f;
+
+        float extrema = zAxisBuffer.get(startIdx);
+        for (int i = startIdx; i <= endIdx; i++) {
+            float value = zAxisBuffer.get(i);
+            if (Math.abs(value) > Math.abs(extrema)) {
+                extrema = value;
+            }
+        }
+        return extrema;
+    }
+
+    private void onPotholeDetectedRoadSurP(PotholeFeatures features, float threshold) {
+        if (currentLocation == null) return;
+
+        detectionCount++;
+
+        // Create unified data structure for sensor-based detection
+        Map<String, Object> eventData = createUnifiedEventData("SENSOR");
+
+        // Add RoadSurP paper specific fields
+        eventData.put("latitude", currentLocation.getLatitude());
+        eventData.put("longitude", currentLocation.getLongitude());
+        eventData.put("speed", features.speed);
+        eventData.put("zt_peak", features.zt);
+        eventData.put("z_prev_extrema", features.zPrev);
+        eventData.put("z_next_extrema", features.zNext);
+        eventData.put("interval_since_last_detection", features.intervalSinceLastDetection);
+        eventData.put("dynamic_threshold", threshold);
+        eventData.put("base_threshold", BASE_THRESHOLD);
+
+        // Raw signature window for ML
+        List<Float> signatureWindow = new ArrayList<>();
+        int startIdx = Math.max(0, zAxisBuffer.size() - 20);
+        int endIdx = Math.min(zAxisBuffer.size(), zAxisBuffer.size());
+        for (int i = startIdx; i < endIdx; i++) {
+            signatureWindow.add(zAxisBuffer.get(i));
+        }
+        eventData.put("raw_signature_window", signatureWindow);
+
+        savePotholeToFirebase(eventData);
+
+        uiHandler.post(() -> {
+            detectionCountText.setText("Detected: " + detectionCount);
+            Toast.makeText(MainActivity.this,
+                    "Pothole detected! Z: " + String.format("%.2f", features.zt),
+                    Toast.LENGTH_SHORT).show();
+        });
+
+        Log.d(TAG, "RoadSurP detection - Z: " + features.zt + ", Threshold: " + threshold);
+    }
+
+    // Unified data structure for both image and sensor detections
+    private Map<String, Object> createUnifiedEventData(String detectionType) {
+        Map<String, Object> eventData = new HashMap<>();
+        String userId = firebaseAuth.getCurrentUser().getUid();
+
+        // Common fields for both detection types
+        eventData.put("timestamp", FieldValue.serverTimestamp());
+        eventData.put("user_id", userId);
+        eventData.put("session_id", currentSessionId);
+        eventData.put("detection_type", detectionType); // "SENSOR" or "IMAGE"
+
+        // Device and environment context
+        eventData.put("device_model", Build.MODEL);
+        eventData.put("device_manufacturer", Build.MANUFACTURER);
+        eventData.put("vehicle_type", "unknown"); // Could be set from user preferences
+        eventData.put("phone_placement", "unknown"); // Could be detected or set by user
+
+        // Location and motion (if available)
+        if (currentLocation != null) {
+            eventData.put("latitude", currentLocation.getLatitude());
+            eventData.put("longitude", currentLocation.getLongitude());
+            eventData.put("altitude", currentLocation.getAltitude());
+            eventData.put("gps_accuracy", currentLocation.getAccuracy());
+        } else {
+            eventData.put("latitude", null);
+            eventData.put("longitude", null);
+            eventData.put("altitude", null);
+            eventData.put("gps_accuracy", null);
+        }
+
+        eventData.put("speed", currentSpeed);
+
+        // Sensor-specific fields (null for image detections)
+        eventData.put("zt_peak", null);
+        eventData.put("z_prev_extrema", null);
+        eventData.put("z_next_extrema", null);
+        eventData.put("interval_since_last_detection", null);
+        eventData.put("dynamic_threshold", null);
+        eventData.put("base_threshold", null);
+        eventData.put("raw_signature_window", null);
+
+        // Image-specific fields (null for sensor detections)
+        eventData.put("imageUrl", null);
+        eventData.put("confidence", null); // For manual/ML confidence scoring
+
+        // Traditional accelerometer data (for backward compatibility)
+        Map<String, Object> accelerometerData = new HashMap<>();
+        accelerometerData.put("x", accelerometerValues[0]);
+        accelerometerData.put("y", accelerometerValues[1]);
+        accelerometerData.put("z", accelerometerValues[2]);
+        eventData.put("accelerometer_data", accelerometerData);
+
+        return eventData;
+    }
+
+    // Helper class for pothole features
+    private static class PotholeFeatures {
+        final float zt;
+        final float zPrev;
+        final float zNext;
+        final long intervalSinceLastDetection;
+        final float speed;
+
+        PotholeFeatures(float zt, float zPrev, float zNext, long interval, float speed) {
+            this.zt = zt;
+            this.zPrev = zPrev;
+            this.zNext = zNext;
+            this.intervalSinceLastDetection = interval;
+            this.speed = speed;
+        }
+    }
+
     // ------ DUMMY TEST DATA CREATOR ------
     private void pushDummyPothole() {
         FirebaseUser dummyUser = firebaseAuth.getCurrentUser();
@@ -406,19 +603,16 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             return;
         }
 
-        Map<String, Object> acceleration = new HashMap<>();
-        acceleration.put("x", 2.1f);
-        acceleration.put("y", 8.3f);
-        acceleration.put("z", 0.4f);
-
-        Map<String, Object> dummyData = new HashMap<>();
-        dummyData.put("timestamp", FieldValue.serverTimestamp());
-        dummyData.put("latitude", 19.0760);      // Example: Mumbai
+        Map<String, Object> dummyData = createUnifiedEventData("SENSOR");
+        dummyData.put("latitude", 19.0760);
         dummyData.put("longitude", 72.8777);
-        dummyData.put("confidence", 95);
-        dummyData.put("speed", 44.2);
-        dummyData.put("user_id", dummyUser.getUid());
-        dummyData.put("accelerometer_data", acceleration);
+        dummyData.put("speed", 44.2f);
+        dummyData.put("zt_peak", 15.5f);
+        dummyData.put("z_prev_extrema", 8.2f);
+        dummyData.put("z_next_extrema", 9.1f);
+        dummyData.put("interval_since_last_detection", 5000L);
+        dummyData.put("dynamic_threshold", 12.0f);
+        dummyData.put("base_threshold", BASE_THRESHOLD);
 
         firestore.collection("potholes")
                 .add(dummyData)
@@ -437,6 +631,11 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             detectionToggle.setChecked(false);
             return;
         }
+
+        // Reset session ID for new detection session
+        currentSessionId = UUID.randomUUID().toString();
+        zAxisBuffer.clear();
+
         isDetectionActive = true;
         statusText.setText("Detection Active - Monitoring for potholes...");
 
@@ -449,7 +648,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         } catch (SecurityException e) {
             Log.e(TAG, "Location permission not granted", e);
         }
-        Log.d(TAG, "Pothole detection started");
+        Log.d(TAG, "RoadSurP pothole detection started");
     }
 
     private void stopDetection() {
@@ -457,42 +656,30 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         statusText.setText("Detection Stopped");
 
         sensorManager.unregisterListener(this);
+        zAxisBuffer.clear();
 
         try {
             locationManager.removeUpdates(this);
         } catch (SecurityException e) {
             Log.e(TAG, "Location permission not granted", e);
         }
-        Log.d(TAG, "Pothole detection stopped");
-    }
-
-    @Override
-    public void onSensorChanged(SensorEvent event) {
-        if (!isDetectionActive) return;
-
-        if (event.sensor.getType() == Sensor.TYPE_ACCELEROMETER) {
-            accelerometerValues = event.values.clone();
-            updateSensorDisplay();
-
-            if (shouldDetectPothole()) {
-                checkForPothole();
-            }
-        } else if (event.sensor.getType() == Sensor.TYPE_GYROSCOPE) {
-            gyroscopeValues = event.values.clone();
-        }
+        Log.d(TAG, "RoadSurP pothole detection stopped");
     }
 
     private void updateSensorDisplay() {
         uiHandler.post(() -> {
+            float dynamicThreshold = calculateDynamicThreshold();
             String sensorData = String.format(
                     "Accelerometer:\nX: %.2f m/s²\nY: %.2f m/s²\nZ: %.2f m/s²\n\n" +
                             "Speed: %.1f km/h\n" +
-                            "Driving: %s\n" +
-                            "Phone in use: %s",
+                            "Dynamic Threshold: %.1f\n" +
+                            "Buffer Size: %d\n" +
+                            "Driving: %s",
                     accelerometerValues[0], accelerometerValues[1], accelerometerValues[2],
                     currentSpeed,
-                    isDriving ? "Yes" : "No",
-                    isPhoneInUse ? "Yes" : "No"
+                    dynamicThreshold,
+                    zAxisBuffer.size(),
+                    isDriving ? "Yes" : "No"
             );
             sensorDataText.setText(sensorData);
             speedText.setText(String.format("%.1f km/h", currentSpeed));
@@ -511,58 +698,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
 
     private void checkPhoneUsage() {
         isPhoneInUse = false;
-    }
-
-    private void checkForPothole() {
-        float magnitude = (float) Math.sqrt(
-                accelerometerValues[0] * accelerometerValues[0] +
-                        accelerometerValues[1] * accelerometerValues[1] +
-                        accelerometerValues[2] * accelerometerValues[2]
-        );
-        long now = System.currentTimeMillis();
-        if (magnitude > POTHOLE_THRESHOLD && (now - lastDetectionTime > DETECTION_COOLDOWN_MS)) {
-            if (validatePotholeDetection(magnitude)) {
-                lastDetectionTime = now;
-                onPotholeDetected(magnitude);
-            }
-        }
-    }
-
-    private boolean validatePotholeDetection(float magnitude) {
-        float confidence = Math.min(100, (magnitude / POTHOLE_THRESHOLD) * 100);
-        return confidence >= CONFIDENCE_THRESHOLD;
-    }
-
-    private void onPotholeDetected(float magnitude) {
-        if (currentLocation == null) return;
-
-        detectionCount++;
-        float confidence = Math.min(100, (magnitude / POTHOLE_THRESHOLD) * 100);
-
-        Map<String, Object> potholeData = new HashMap<>();
-        potholeData.put("timestamp", FieldValue.serverTimestamp());
-        potholeData.put("latitude", currentLocation.getLatitude());
-        potholeData.put("longitude", currentLocation.getLongitude());
-        potholeData.put("confidence", Math.round(confidence));
-        potholeData.put("speed", currentSpeed);
-        potholeData.put("user_id", firebaseAuth.getCurrentUser().getUid());
-
-        Map<String, Object> accelerometerData = new HashMap<>();
-        accelerometerData.put("x", accelerometerValues[0]);
-        accelerometerData.put("y", accelerometerValues[1]);
-        accelerometerData.put("z", accelerometerValues[2]);
-        potholeData.put("accelerometer_data", accelerometerData);
-
-        savePotholeToFirebase(potholeData);
-
-        uiHandler.post(() -> {
-            detectionCountText.setText("Detected: " + detectionCount);
-            Toast.makeText(MainActivity.this,
-                    String.format("Pothole detected! Confidence: %.0f%%", confidence),
-                    Toast.LENGTH_SHORT).show();
-        });
-
-        Log.d(TAG, "Pothole detected with confidence: " + confidence + "%");
     }
 
     private void savePotholeToFirebase(Map<String, Object> potholeData) {
@@ -633,7 +768,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
         super.onRequestPermissionsResult(requestCode, permissions, grantResults);
 
         if (requestCode == PERMISSION_REQUEST_CODE) {
-            // Debug: Log the results
             Log.d(TAG, "Permission results:");
             for (int i = 0; i < permissions.length; i++) {
                 String status = (i < grantResults.length && grantResults[i] == PackageManager.PERMISSION_GRANTED)
@@ -641,7 +775,6 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                 Log.d(TAG, permissions[i] + ": " + status);
             }
 
-            // Check each permission individually
             boolean cameraGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.CAMERA)
                     == PackageManager.PERMISSION_GRANTED;
             boolean locationGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.ACCESS_FINE_LOCATION)
@@ -651,26 +784,21 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
             boolean storageGranted = ContextCompat.checkSelfPermission(this, Manifest.permission.WRITE_EXTERNAL_STORAGE)
                     == PackageManager.PERMISSION_GRANTED;
 
-            // Log current permission status
             Log.d(TAG, "Current permission status:");
             Log.d(TAG, "Camera: " + cameraGranted);
             Log.d(TAG, "Fine Location: " + locationGranted);
             Log.d(TAG, "Coarse Location: " + coarseLocationGranted);
             Log.d(TAG, "Storage: " + storageGranted);
 
-            // Check if essential permissions are granted (camera and at least one location permission)
             boolean essentialPermissionsGranted = cameraGranted && (locationGranted || coarseLocationGranted);
 
             if (!essentialPermissionsGranted) {
-                // Show specific message about which permissions are missing
                 StringBuilder missingPermissions = new StringBuilder("Missing permissions: ");
                 if (!cameraGranted) missingPermissions.append("Camera ");
                 if (!locationGranted && !coarseLocationGranted) missingPermissions.append("Location ");
                 if (!storageGranted) missingPermissions.append("Storage ");
 
                 Toast.makeText(this, missingPermissions.toString(), Toast.LENGTH_LONG).show();
-
-                // Optionally show system settings to manually grant permissions
                 showPermissionSettingsDialog();
             } else {
                 Toast.makeText(this, "Permissions granted successfully!", Toast.LENGTH_SHORT).show();
