@@ -92,7 +92,7 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
     // RoadSurP Paper Implementation Variables
     private ArrayList<Float> zAxisBuffer = new ArrayList<>();
     private static final int BUFFER_SIZE = 50; // ~1 second at 50Hz
-    private static final float BASE_THRESHOLD = 8.0f; // T0 - base threshold
+    private static final float BASE_THRESHOLD = 11.0f; // T0 - base threshold
     private static final float SPEED_SCALING_FACTOR = 0.1f; // S - speed scaling
     private static final float SPEED_OFFSET = 5.0f; // L - speed offset
     private long lastDetectionTime = 0;
@@ -290,7 +290,9 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                         File compressedFile = new File(getCacheDir(), "pothole_compressed_" + System.currentTimeMillis() + ".jpg");
                         compressImageFile(photoFile, compressedFile);
                         photoFile.delete();
-                        getCurrentLocationAndUpload(compressedFile);
+
+                        // Show dialog to user after capture
+                        runOnUiThread(() -> showSubmitRetakeCancelDialog(compressedFile));
                     }
 
                     @Override
@@ -300,6 +302,35 @@ public class MainActivity extends AppCompatActivity implements SensorEventListen
                     }
                 });
     }
+
+    private void showSubmitRetakeCancelDialog(File photoFile) {
+        new androidx.appcompat.app.AlertDialog.Builder(this)
+                .setTitle("Submit Pothole Report")
+                .setMessage("Do you want to submit this pothole report?")
+                .setPositiveButton("Submit", (dialog, which) -> {
+                    // Upload the photo and data
+                    getCurrentLocationAndUpload(photoFile);
+                })
+                .setNeutralButton("Retake", (dialog, which) -> {
+                    // Delete photo and keep camera UI for retake
+                    if (photoFile.exists()) {
+                        photoFile.delete();
+                    }
+                    Toast.makeText(MainActivity.this, "Please retake the photo.", Toast.LENGTH_SHORT).show();
+                    // Optionally reset UI to camera preview if needed
+                })
+                .setNegativeButton("Cancel", (dialog, which) -> {
+                    // Delete photo and hide camera UI
+                    if (photoFile.exists()) {
+                        photoFile.delete();
+                    }
+                    hideCameraUI();
+                    Toast.makeText(MainActivity.this, "Submission cancelled.", Toast.LENGTH_SHORT).show();
+                })
+                .setCancelable(false)
+                .show();
+    }
+
 
     private void compressImageFile(File originalFile, File compressedFile) {
         try {
